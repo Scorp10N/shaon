@@ -1,6 +1,7 @@
-# authveil: credential-isolating proxy for shaon (design)
+# authveil: general auth-decoupling gateway (design)
 
-**Date:** 2026-07-20
+**Date:** 2026-07-20 (revised same day — broadened from a Hilan-specific
+proxy to a general adapter-based gateway; see revision note below)
 **Status:** Approved for planning
 
 ## Context
@@ -29,6 +30,14 @@ to over a private network. `shaon` itself keeps working unmodified from the
 CLI/MCP-tool-surface point of view; it just never touches a real credential
 again.
 
+**Revision note:** the driving need is still Hilan/shaon, but the actual
+purpose of this project is broader than that one integration: **decouple any
+client tool from the authentication process itself, for both legacy
+(password+MFA form) and modern (OIDC/SAML/OAuth) auth**, so credentials never
+have to live anywhere near the tool that uses them. `authveil` is designed
+as a general adapter-based gateway from the start, with Hilan as its first
+adapter — see "Adapter model" below.
+
 ## Architecture
 
 ```
@@ -39,27 +48,59 @@ again.
                                 never the real company subdomain)
 ```
 
-`authveil` is a new, standalone project: a generic credential-isolating
-reverse proxy for legacy web portals that only support username+password+TOTP
-login (no OIDC/SAML — otherwise you'd just use a normal SSO broker, and this
-wouldn't be needed). It holds the real credentials and MFA secret for a
-target portal, logs in and refreshes sessions on its own, and reverse-proxies
-an authenticated session to a client that never sees the real domain or
-credentials. Hilan is its first adapter; the design keeps the Hilan-specific
-logic behind an adapter interface so the same proxy can front other
-non-SSO portals later.
+`authveil` is a new, standalone project: a general credential-isolating
+reverse proxy and auth gateway. It holds the real credentials/MFA secrets for
+a target, performs authentication on its own (however that target requires),
+and reverse-proxies an authenticated session to a client that never sees the
+real domain or credentials — regardless of whether the target speaks a
+legacy password+TOTP web form or standard OIDC/SAML/OAuth.
 
 We looked at reusing an existing open-source broker instead of building this
 (Teleport Application Access, Pomerium, oauth2-proxy, Boundary, Infisical,
 Vault Agent, and MCP-specific projects like `zerocreds-mcp` / `secrets-mcp` /
-`qred-mcp-proxy`) — confirmed via independent research (Antigravity). None of
-them fit: they all broker access *into* something that already speaks
-OIDC/SAML, or they inject secrets into a process/tool-call rather than
-autonomously logging into a legacy web form and reverse-proxying the
-resulting session. `zerocreds-mcp` is the closest conceptual match (browser
-automation so an AI client never sees raw credentials) but is an agent
-tool-runner, not an HTTP reverse proxy. The standard real-world shape for
-this exact problem is a bespoke sidecar, which is what `authveil` is.
+`qred-mcp-proxy`) — confirmed via independent research (Antigravity). For the
+*legacy* case none of them fit: they all broker access *into* something that
+already speaks OIDC/SAML, or they inject secrets into a process/tool-call
+rather than autonomously logging into a legacy web form and reverse-proxying
+the resulting session. `zerocreds-mcp` is the closest conceptual match
+(browser automation so an AI client never sees raw credentials) but is an
+agent tool-runner, not an HTTP reverse proxy. For the *modern* (OIDC/SAML)
+case, tools like `oauth2-proxy` and Pomerium already solve session brokering
+well — so `authveil` doesn't reimplement that logic, it wraps one of them as
+an adapter (see below) rather than competing with it.
+
+## Adapter model
+
+`authveil` exposes one consistent reverse-proxy interface to clients. Behind
+it, a `PortalAdapter` trait (`login`, `is_session_expired`, `refresh`, plus a
+flag for whether the adapter owns session lifecycle itself or delegates to a
+wrapped broker process) abstracts over how a given target is actually
+authenticated:
+
+1. **Legacy form adapter** (Hilan, built in v1) — owns its own session
+   lifecycle: custom login automation (username+password+TOTP generated from
+   a stored RFC 6238 seed), because no existing OSS project solves this case.
+2. **OIDC/SAML/OAuth adapter** (designed for, not built in v1) — delegates to
+   a wrapped instance of an existing broker (`oauth2-proxy` first choice,
+   already used elsewhere in this infra; Pomerium as a fallback), rather
+   than reimplementing SSO brokering. Not built now — there's no second
+   target needing it yet, and building it speculatively would be unvalidated
+   work. The trait is shaped so adding it later doesn't require revisiting
+   the interface.
+3. **WebAuthn/passkey adapter — explicitly deferred, no v1 work at all.**
+   WebAuthn is a fundamentally different problem from the other two: the
+   private key never leaves the authenticator and isn't exportable, so
+   there's no portable secret for a server-side proxy to store and replay.
+   Automating it would need either a virtual software authenticator (widely
+   detected/blocked) or physical hardware-key forwarding, and risks crossing
+   the same "don't build MFA-bypass tooling" line `shaon`'s own
+   `CONTRIBUTING.md` already draws. Needs its own dedicated research pass
+   before any design commitment, not a v1 concern.
+
+**v1 build scope:** only the Hilan legacy adapter gets implemented. This is
+a deliberate YAGNI call — the adapter trait is shaped for reuse, but the
+OIDC/SAML wrapper and WebAuthn support stay design-only until a real second
+target exists to validate them against.
 
 ## Components
 
