@@ -14,6 +14,7 @@ pub mod payslip;
 pub mod provider;
 pub mod reports;
 
+pub use client::{import_captured_cookies, CapturedCookie};
 pub use config::Config;
 pub use provider::HilanProvider;
 

@@ -1475,6 +1475,69 @@ fn salary_amount(row: &BTreeMap<String, serde_json::Value>, key: &str) -> Result
     }
 }
 
+/// A single cookie captured out-of-band (e.g. from an interactive Playwright
+/// login session), before it's written into HilanClient's own encrypted
+/// on-disk cache.
+#[derive(Debug, Clone)]
+pub struct CapturedCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+}
+
+/// Import cookies captured out-of-band into the same encrypted on-disk
+/// cache format `HilanClient::new` reads on startup — used by
+/// authveil-style proxies that perform the actual Hilan login themselves,
+/// outside shaon's own process, so shaon never handles a real password.
+pub fn import_captured_cookies(config: &Config, cookies: Vec<CapturedCookie>) -> Result<()> {
+    let mut store = cookie_store::CookieStore::default();
+    let request_url = reqwest::Url::parse(&format!("https://{}.hilan.co.il/", config.subdomain))
+        .context("build request URL for cookie import")?;
+
+    for captured in cookies {
+        let raw = cookie::Cookie::build((captured.name.clone(), captured.value.clone()))
+            .domain(captured.domain.clone())
+            .path(captured.path.clone())
+            .secure(captured.secure)
+            .http_only(captured.http_only)
+            .build();
+        store
+            .insert_raw(&raw, &request_url)
+            .map_err(|e| anyhow!("insert captured cookie '{}': {e}", captured.name))?;
+    }
+
+    let cookie_dir = crate::config::subdomain_dir(&config.subdomain);
+    fs::create_dir_all(&cookie_dir).context("create cookie cache dir")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cookie_dir, fs::Permissions::from_mode(0o700))
+            .context("chmod cookie cache dir")?;
+    }
+
+    let mut plaintext = Vec::new();
+    cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, &mut plaintext)
+        .map_err(|e| anyhow!("serialize captured cookies: {e}"))?;
+
+    let local_master_key = config.get_local_master_key()?;
+    let key = derive_local_dek(&local_master_key, COOKIE_CACHE_KEY_INFO)?;
+    let encrypted = encrypt_cookie_blob(&key, &plaintext)?;
+
+    let cookie_path = cookie_dir.join("cookies.json");
+    fs::write(&cookie_path, encrypted).context("write encrypted cookie cache")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cookie_path, fs::Permissions::from_mode(0o600))
+            .context("chmod cookie cache file")?;
+    }
+
+    Ok(())
+}
+
 fn load_cookie_store(config: &Config, cookie_path: &Path) -> Result<cookie_store::CookieStore> {
     let encrypted =
         fs::read(cookie_path).with_context(|| format!("read {}", cookie_path.display()))?;
@@ -1635,6 +1698,57 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn import_captured_cookies_makes_new_client_see_a_session_candidate() {
+        // Isolate this test's cookie cache dir, same technique as
+        // provider-hilan's own config.rs tests use for XDG_CONFIG_HOME
+        // isolation — avoids clobbering a real ~/.config/shaon during tests.
+        let temp_home = test_home_dir("import-captured-cookies");
+        std::fs::create_dir_all(&temp_home).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &temp_home);
+
+        let config = Config {
+            subdomain: "acme".to_string(),
+            username: "12345".to_string(),
+            password: None,
+            payslip_folder: None,
+            payslip_format: None,
+            proxy_url: None,
+        };
+        config
+            .store_credentials("unused-in-this-test", &[0x77; LOCAL_MASTER_KEY_LEN])
+            .unwrap();
+
+        let cookies = vec![
+            CapturedCookie {
+                name: "HilanAuth".to_string(),
+                value: "captured-session-token".to_string(),
+                domain: "acme.hilan.co.il".to_string(),
+                path: "/".to_string(),
+                secure: true,
+                http_only: true,
+            },
+            CapturedCookie {
+                name: "ASP.NET_SessionId".to_string(),
+                value: "captured-aspnet-session".to_string(),
+                domain: "acme.hilan.co.il".to_string(),
+                path: "/".to_string(),
+                secure: true,
+                http_only: true,
+            },
+        ];
+
+        import_captured_cookies(&config, cookies).unwrap();
+
+        let client = HilanClient::new(config).unwrap();
+        assert!(
+            client.session_candidate,
+            "expected imported cookies to be picked up as a session candidate"
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]

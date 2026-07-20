@@ -1790,6 +1790,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "cookie",
  "cookie_store 0.21.1",
  "hkdf",
  "hr-core",
