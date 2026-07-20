@@ -1702,12 +1702,12 @@ mod tests {
 
     #[test]
     fn import_captured_cookies_makes_new_client_see_a_session_candidate() {
-        // Isolate this test's cookie cache dir, same technique as
-        // provider-hilan's own config.rs tests use for XDG_CONFIG_HOME
-        // isolation — avoids clobbering a real ~/.config/shaon during tests.
+        let _env_guard = crate::config::test_env_lock().lock().unwrap();
+        // Isolate this test's cookie cache dir. subdomain_dir() is derived
+        // from HOME, so this must not rely on the real user's home directory.
         let temp_home = test_home_dir("import-captured-cookies");
         std::fs::create_dir_all(&temp_home).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &temp_home);
+        std::env::set_var("HOME", &temp_home);
 
         let config = Config {
             subdomain: "acme".to_string(),
@@ -1748,7 +1748,7 @@ mod tests {
             "expected imported cookies to be picked up as a session candidate"
         );
 
-        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(temp_home).unwrap();
     }
 
     #[test]
