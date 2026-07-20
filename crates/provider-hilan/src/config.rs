@@ -68,6 +68,14 @@ pub struct Config {
 
     pub payslip_folder: Option<String>,
     pub payslip_format: Option<String>,
+
+    /// When set, `HilanClient` sends all requests to this base URL instead
+    /// of `https://{subdomain}.hilan.co.il`, and never attempts its own
+    /// password login — used to point at an authveil-style proxy that owns
+    /// Hilan authentication instead of shaon. `subdomain` becomes a purely
+    /// local label (cache directory naming only) in this mode.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 pub struct PendingStoredCredentials {
@@ -105,6 +113,7 @@ impl fmt::Debug for Config {
             .field("password", &"[REDACTED]")
             .field("payslip_folder", &self.payslip_folder)
             .field("payslip_format", &self.payslip_format)
+            .field("proxy_url", &self.proxy_url)
             .finish()
     }
 }
@@ -416,6 +425,7 @@ mod tests {
             password: None,
             payslip_folder: None,
             payslip_format: None,
+            proxy_url: None,
         }
     }
 
@@ -431,6 +441,7 @@ mod tests {
             password: Some("supersecret".to_string()),
             payslip_folder: None,
             payslip_format: None,
+            proxy_url: None,
         };
         let debug_output = format!("{config:?}");
         assert!(
@@ -451,6 +462,7 @@ mod tests {
             password: Some("supersecret".to_string()),
             payslip_folder: None,
             payslip_format: None,
+            proxy_url: None,
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(
@@ -460,6 +472,30 @@ mod tests {
         assert!(
             !serialized.contains("supersecret"),
             "Serialized config must not contain password value"
+        );
+    }
+
+    #[test]
+    fn config_deserializes_without_proxy_url_field() {
+        let toml_str = r#"
+            subdomain = "acme"
+            username = "12345"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.proxy_url, None);
+    }
+
+    #[test]
+    fn config_deserializes_with_proxy_url_field() {
+        let toml_str = r#"
+            subdomain = "work"
+            username = "12345"
+            proxy_url = "https://authveil.example.ts.net"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.proxy_url.as_deref(),
+            Some("https://authveil.example.ts.net")
         );
     }
 
@@ -515,6 +551,7 @@ mod tests {
             password: Some("oldpass".to_string()),
             payslip_folder: None,
             payslip_format: None,
+            proxy_url: None,
         };
 
         let err = config
