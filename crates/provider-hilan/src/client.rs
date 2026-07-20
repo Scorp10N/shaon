@@ -134,21 +134,32 @@ impl HilanClient {
             .build()
             .context("build HTTP client")?;
 
-        // Validate subdomain to prevent URL manipulation via malicious config
-        if !config
-            .subdomain
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-        {
-            anyhow::bail!(
-                "subdomain '{}' contains invalid characters (only alphanumeric, hyphens, and dots allowed)",
-                config.subdomain
-            );
-        }
-        let base_url = format!("https://{}.hilan.co.il", config.subdomain);
+        let base_url = if let Some(proxy_url) = config.proxy_url.clone() {
+            // Proxy mode: base_url is whatever the caller configured (e.g. an
+            // authveil-style credential-isolating proxy). subdomain is not
+            // used to build a URL in this mode, so it doesn't need the
+            // strict validation below — it's just a local cache-dir label.
+            proxy_url
+        } else {
+            // Validate subdomain to prevent URL manipulation via malicious config
+            if !config
+                .subdomain
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+            {
+                anyhow::bail!(
+                    "subdomain '{}' contains invalid characters (only alphanumeric, hyphens, and dots allowed)",
+                    config.subdomain
+                );
+            }
+            format!("https://{}.hilan.co.il", config.subdomain)
+        };
 
-        // Check if we have cached session cookies (candidate, not proven auth)
-        let has_session_candidate = {
+        // Check if we have cached session cookies (candidate, not proven auth).
+        // In proxy mode, the proxy owns authentication entirely — always
+        // treat the session as a candidate so login()/get_password() never
+        // gets called from this side.
+        let has_session_candidate = config.proxy_url.is_some() || {
             let store = cookie_store.lock().unwrap();
             // Look for auth-related cookies, not just any cookie
             store.iter_any().count() > 1
@@ -229,6 +240,13 @@ impl HilanClient {
 
     /// Log in to Hilan with credentials, even if cached cookies exist.
     pub async fn login(&mut self) -> Result<()> {
+        if self.config.proxy_url.is_some() {
+            anyhow::bail!(
+                "authveil proxy session unavailable or expired; shaon cannot \
+                 re-authenticate on its own in proxy mode. Check the authveil \
+                 service instead of running `shaon auth`."
+            );
+        }
         let secret = self.config.get_password()?;
         self.login_with_password(secret.expose_secret()).await
     }
@@ -1619,6 +1637,52 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn new_uses_proxy_url_as_base_url_and_skips_subdomain_validation() {
+        let config = Config {
+            subdomain: "work".to_string(), // opaque local label, not a real subdomain
+            username: "12345".to_string(),
+            password: None,
+            payslip_folder: None,
+            payslip_format: None,
+            proxy_url: Some("https://authveil.example.ts.net".to_string()),
+        };
+        let client = HilanClient::new(config).unwrap();
+        assert_eq!(client.base_url, "https://authveil.example.ts.net");
+    }
+
+    #[test]
+    fn new_forces_session_candidate_true_when_proxy_url_set() {
+        let config = Config {
+            subdomain: "work".to_string(),
+            username: "12345".to_string(),
+            password: None,
+            payslip_folder: None,
+            payslip_format: None,
+            proxy_url: Some("https://authveil.example.ts.net".to_string()),
+        };
+        let client = HilanClient::new(config).unwrap();
+        assert!(client.session_candidate);
+    }
+
+    #[tokio::test]
+    async fn login_fails_fast_in_proxy_mode_without_calling_get_password() {
+        let config = Config {
+            subdomain: "work".to_string(),
+            username: "12345".to_string(),
+            password: None,
+            payslip_folder: None,
+            payslip_format: None,
+            proxy_url: Some("https://authveil.example.ts.net".to_string()),
+        };
+        let mut client = HilanClient::new(config).unwrap();
+        let err = client.login().await.unwrap_err();
+        assert!(
+            err.to_string().contains("authveil"),
+            "expected proxy-mode error message, got: {err}"
+        );
+    }
+
     fn build_test_client(base_url: String, session_candidate: bool) -> HilanClient {
         let config = Config {
             subdomain: "acme".to_string(),
@@ -1626,6 +1690,7 @@ mod tests {
             password: None,
             payslip_folder: None,
             payslip_format: None,
+            proxy_url: None,
         };
         config
             .store_credentials("s3cret", &[0x44; LOCAL_MASTER_KEY_LEN])
