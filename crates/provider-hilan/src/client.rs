@@ -1705,6 +1705,7 @@ mod tests {
         let _env_guard = crate::config::test_env_lock().lock().unwrap();
         // Isolate this test's cookie cache dir. subdomain_dir() is derived
         // from HOME, so this must not rely on the real user's home directory.
+        let original_home = std::env::var_os("HOME");
         let temp_home = test_home_dir("import-captured-cookies");
         std::fs::create_dir_all(&temp_home).unwrap();
         std::env::set_var("HOME", &temp_home);
@@ -1749,6 +1750,10 @@ mod tests {
         );
 
         std::fs::remove_dir_all(temp_home).unwrap();
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
