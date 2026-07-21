@@ -283,6 +283,7 @@ pub async fn read_calendar(client: &mut HilanClient, month: NaiveDate) -> Result
             || d.attendance_type.is_some()
             || d.has_error
     });
+    let mut already_probed_selected_days = false;
     if !has_real_data {
         tracing::debug!(
             "Calendar page has {} day(s) but no attendance data for {}; trying async postback for full grid",
@@ -301,13 +302,21 @@ pub async fn read_calendar(client: &mut HilanClient, month: NaiveDate) -> Result
                     "async postback returned no days, falling back to day-by-day probe"
                 );
                 days = probe_month_days(client, &url, &fields, month).await?;
+                already_probed_selected_days = true;
             }
             Err(e) => {
                 tracing::debug!("async postback failed: {e}, falling back to day-by-day probe");
                 days = probe_month_days(client, &url, &fields, month).await?;
+                already_probed_selected_days = true;
             }
         }
     }
+
+    if !already_probed_selected_days && !days.is_empty() {
+        let enrichment_result = probe_month_days(client, &url, &fields, month).await;
+        days = apply_selected_day_enrichment(days, enrichment_result);
+    }
+
     tracing::debug!(
         "Parsed {} calendar days for {} (employee {})",
         days.len(),
@@ -646,6 +655,37 @@ fn merge_calendar_days(days: Vec<CalendarDay>) -> Vec<CalendarDay> {
         }
     }
     merged.into_values().collect()
+}
+
+fn merge_calendar_days_with_selected_details(
+    mut visual_days: Vec<CalendarDay>,
+    selected_detail_days: Vec<CalendarDay>,
+) -> Vec<CalendarDay> {
+    visual_days.extend(selected_detail_days);
+    merge_calendar_days(visual_days)
+}
+
+/// Apply the selected-day detail enrichment probe's result to the visual
+/// month grid, falling back to the visual-only data (rather than failing
+/// the whole calendar read) if the probe itself failed. The probe issues
+/// one request per day of the month; a transient failure partway through
+/// shouldn't take down a read that already has valid, if less precise,
+/// visual data.
+fn apply_selected_day_enrichment(
+    visual_days: Vec<CalendarDay>,
+    enrichment_result: Result<Vec<CalendarDay>>,
+) -> Vec<CalendarDay> {
+    match enrichment_result {
+        Ok(selected_day_details) => {
+            merge_calendar_days_with_selected_details(visual_days, selected_day_details)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "selected-day detail enrichment failed, keeping visual-grid data only: {e:#}"
+            );
+            visual_days
+        }
+    }
 }
 
 fn merge_calendar_day_into(existing: &mut CalendarDay, candidate: CalendarDay) {
@@ -2476,6 +2516,160 @@ mod tests {
         assert_eq!(day.exit_time.as_deref(), Some("18:00"));
         assert_eq!(day.attendance_type.as_deref(), Some("work from home"));
         assert_eq!(day.source, hr_core::AttendanceSource::UserReported);
+    }
+
+    #[test]
+    fn selected_day_detail_probe_overrides_visual_total_for_june_14() {
+        let month = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let visual_days = parse_calendar_html(
+            r#"
+            <html><body><table><tbody><tr>
+                <td class="cDIES" Days="9661" tabindex="0" aria-label="14" title="09:39">
+                    <table class="iDSIE">
+                        <tr class="dayImageNumberContainer">
+                            <td class="dTS">14</td>
+                            <td class="imageContainerStyle"></td>
+                        </tr>
+                        <tr>
+                            <td class="calendarMessageCell" colspan="2"><div class="cDM">09:39</div></td>
+                        </tr>
+                    </table>
+                </td>
+            </tr></tbody></table></body></html>
+            "#,
+            month,
+        )
+        .expect("parse visual month cell");
+        let detail_days = parse_calendar_html(
+            r#"
+            <html><body><table><tbody>
+                <tr id="ctl00_mp_RG_Days_123456_2026_06_row_0">
+                    <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ReportDate_row_0" ov="14/06 יום&nbsp;א"></td>
+                    <td>
+                        <table><tbody>
+                            <tr id="ctl00_mp_RG_Days_123456_2026_06_EmployeeReports_row_0_0">
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ManualEntry_EmployeeReports_row_0_0">
+                                    <input name="ctl00$mp$RG_Days_123456_2026_06$cellOf_ManualEntry_EmployeeReports_row_0_0$ManualEntry_EmployeeReports_row_0_0" value="09:30" />
+                                </td>
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ManualExit_EmployeeReports_row_0_0">
+                                    <input name="ctl00$mp$RG_Days_123456_2026_06$cellOf_ManualExit_EmployeeReports_row_0_0$ManualExit_EmployeeReports_row_0_0" value="19:09" />
+                                </td>
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ManualTotal_EmployeeReports_row_0_0">09:39</td>
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_Symbol.SymbolId_EmployeeReports_row_0_0">
+                                    <select name="ctl00$mp$RG_Days_123456_2026_06$cellOf_Symbol.SymbolId_EmployeeReports_row_0_0$Symbol.SymbolId_EmployeeReports_row_0_0">
+                                        <option value="0" selected="selected">נוכחות</option>
+                                        <option value="120">עבודה מהבית</option>
+                                    </select>
+                                </td>
+                            </tr>
+                        </tbody></table>
+                    </td>
+                </tr>
+            </tbody></table></body></html>
+            "#,
+            month,
+        )
+        .expect("parse selected-day detail row");
+
+        let days = merge_calendar_days_with_selected_details(visual_days, detail_days);
+        let day = days
+            .iter()
+            .find(|day| day.date == NaiveDate::from_ymd_opt(2026, 6, 14).unwrap())
+            .expect("day 2026-06-14");
+
+        assert_eq!(day.entry_time.as_deref(), Some("09:30"));
+        assert_eq!(day.exit_time.as_deref(), Some("19:09"));
+        assert_eq!(day.total_hours.as_deref(), Some("09:39"));
+        assert_eq!(day.attendance_type.as_deref(), Some("נוכחות"));
+    }
+
+    #[test]
+    fn selected_day_detail_probe_preserves_work_from_home_type_for_june_23() {
+        let month = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let visual_days = parse_calendar_html(
+            r#"
+            <html><body><table><tbody><tr>
+                <td class="cDIES" Days="9670" tabindex="0" aria-label="23" title="09:30">
+                    <table class="iDSIE">
+                        <tr class="dayImageNumberContainer">
+                            <td class="dTS">23</td>
+                            <td class="imageContainerStyle"></td>
+                        </tr>
+                        <tr>
+                            <td class="calendarMessageCell" colspan="2"><div class="cDM">09:30</div></td>
+                        </tr>
+                    </table>
+                </td>
+            </tr></tbody></table></body></html>
+            "#,
+            month,
+        )
+        .expect("parse visual month cell");
+        let detail_days = parse_calendar_html(
+            r#"
+            <html><body><table><tbody>
+                <tr id="ctl00_mp_RG_Days_123456_2026_06_row_0">
+                    <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ReportDate_row_0" ov="23/06 יום&nbsp;ג"></td>
+                    <td>
+                        <table><tbody>
+                            <tr id="ctl00_mp_RG_Days_123456_2026_06_EmployeeReports_row_0_0">
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ManualEntry_EmployeeReports_row_0_0">
+                                    <input name="ctl00$mp$RG_Days_123456_2026_06$cellOf_ManualEntry_EmployeeReports_row_0_0$ManualEntry_EmployeeReports_row_0_0" value="09:00" />
+                                </td>
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ManualExit_EmployeeReports_row_0_0">
+                                    <input name="ctl00$mp$RG_Days_123456_2026_06$cellOf_ManualExit_EmployeeReports_row_0_0$ManualExit_EmployeeReports_row_0_0" value="18:30" />
+                                </td>
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_ManualTotal_EmployeeReports_row_0_0">09:30</td>
+                                <td id="ctl00_mp_RG_Days_123456_2026_06_cellOf_Symbol.SymbolId_EmployeeReports_row_0_0">
+                                    <select name="ctl00$mp$RG_Days_123456_2026_06$cellOf_Symbol.SymbolId_EmployeeReports_row_0_0$Symbol.SymbolId_EmployeeReports_row_0_0">
+                                        <option value="0">נוכחות</option>
+                                        <option value="120" selected="selected">עבודה מהבית</option>
+                                    </select>
+                                </td>
+                            </tr>
+                        </tbody></table>
+                    </td>
+                </tr>
+            </tbody></table></body></html>
+            "#,
+            month,
+        )
+        .expect("parse selected-day detail row");
+
+        let days = merge_calendar_days_with_selected_details(visual_days, detail_days);
+        let day = days
+            .iter()
+            .find(|day| day.date == NaiveDate::from_ymd_opt(2026, 6, 23).unwrap())
+            .expect("day 2026-06-23");
+
+        assert_eq!(day.entry_time.as_deref(), Some("09:00"));
+        assert_eq!(day.exit_time.as_deref(), Some("18:30"));
+        assert_eq!(day.total_hours.as_deref(), Some("09:30"));
+        assert_eq!(day.attendance_type.as_deref(), Some("עבודה מהבית"));
+    }
+
+    #[test]
+    fn selected_day_enrichment_falls_back_to_visual_data_on_probe_failure() {
+        let visual_days = vec![CalendarDay {
+            date: NaiveDate::from_ymd_opt(2026, 6, 14).unwrap(),
+            day_name: "יום א".to_string(),
+            has_error: false,
+            error_message: None,
+            entry_time: None,
+            exit_time: None,
+            attendance_type: None,
+            total_hours: Some("09:39".to_string()),
+            source: hr_core::AttendanceSource::UserReported,
+        }];
+
+        let result = apply_selected_day_enrichment(
+            visual_days,
+            Err(anyhow!("simulated network failure mid-probe")),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].total_hours.as_deref(), Some("09:39"));
+        assert_eq!(result[0].entry_time, None);
     }
 
     #[test]
